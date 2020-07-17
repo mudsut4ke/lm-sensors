@@ -67,7 +67,8 @@ function LoadConfig
 	FCFANS=`egrep '^FCFANS=.*$' $1 | sed -e 's/FCFANS=//g'`
 	MINPWM=`egrep '^MINPWM=.*$' $1 | sed -e 's/MINPWM=//g'`
 	MAXPWM=`egrep '^MAXPWM=.*$' $1 | sed -e 's/MAXPWM=//g'`
-
+	THYST=`egrep '^THYST=.*$' $1 | sed -e 's/THYST=//g'`
+	echo 
 	# Check whether all mandatory settings are set
 	if [[ -z ${INTERVAL} || -z ${FCTEMPS} || -z ${MINTEMP} || -z ${MAXTEMP} || -z ${MINSTART} || -z ${MINSTOP} ]]
 	then
@@ -99,6 +100,7 @@ function LoadConfig
 		AFCPWM[$fcvcount]=`echo $fcv |cut -d'=' -f1`
 		AFCTEMP[$fcvcount]=`echo $fcv |cut -d'=' -f2`
 		AFCFAN[$fcvcount]=`echo $FCFANS |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
+		AFCFANFAULT[$fcvcount]=`echo "${AFCFAN[$fcvcount]}" |sed -e 's/input/fault/g'`
 		AFCMINTEMP[$fcvcount]=`echo $MINTEMP |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
 		AFCMAXTEMP[$fcvcount]=`echo $MAXTEMP |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
 		AFCMINSTART[$fcvcount]=`echo $MINSTART |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
@@ -107,6 +109,8 @@ function LoadConfig
 		[ -z "${AFCMINPWM[$fcvcount]}" ] && AFCMINPWM[$fcvcount]=0
 		AFCMAXPWM[$fcvcount]=`echo $MAXPWM |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
 		[ -z "${AFCMAXPWM[$fcvcount]}" ] && AFCMAXPWM[$fcvcount]=255
+		AFCTHYST[$fcvcount]=`echo $THYST |sed -e 's/ /\n/g' |egrep "${AFCPWM[$fcvcount]}" |cut -d'=' -f2`
+		[ -z "${AFCTHYST[$fcvcount]}" ] && AFCTHYST[$fcvcount]=0
 
 		# verify the validity of the settings
 		if [ "${AFCMINTEMP[$fcvcount]}" -ge "${AFCMAXTEMP[$fcvcount]}" ]
@@ -150,9 +154,25 @@ function LoadConfig
 		echo "  MINSTOP=${AFCMINSTOP[$fcvcount]}"
 		echo "  MINPWM=${AFCMINPWM[$fcvcount]}"
 		echo "  MAXPWM=${AFCMAXPWM[$fcvcount]}"
+		echo "  THYST=${AFCTHYST[$fcvcount]}"
 		let fcvcount=fcvcount+1
 	done
 	echo
+}
+
+function CheckFanFault()
+{
+	let fancount=0
+	while (( $fancount < ${#AFCFANFAULT[@]} )) # go through all fan fault.
+	do
+		fault=`cat ${AFCFANFAULT[$fancount]}`
+		if [[ "$fault" == "1" ]]
+		then
+			return 1 # fan fault detected
+		fi
+		let fancount=$fancount+1
+	done
+	return 0
 }
 
 function DevicePath()
@@ -350,11 +370,11 @@ fi
 cd $DIR
 
 # Check for configuration change
-if [ "$DIR" != "/" ] && [ -z "$DEVPATH" -o -z "$DEVNAME" ]
-then
-	echo "Configuration is too old, please run pwmconfig again" >&2
-	exit 1
-fi
+# if [ "$DIR" != "/" ] && [ -z "$DEVPATH" -o -z "$DEVNAME" ]
+# then
+# 	echo "Configuration is too old, please run pwmconfig again" >&2
+# 	exit 1
+# fi
 if [ "$DIR" = "/" -a -n "$DEVPATH" ]
 then
 	echo "Unneeded DEVPATH with absolute device paths" >&2
@@ -448,11 +468,36 @@ function restorefans()
 trap 'restorefans 0' SIGQUIT SIGTERM
 trap 'restorefans 1' SIGHUP SIGINT
 
+function upperBound
+{
+    # $1: temperature
+    # $2: Tmin
+    # $3: Tmax
+    # $4: MinPWM
+    # $5: MaxPWM
+    # $6 Thyst
+    # upper_bound = (temperature-Tmin+2) * (MaxPWM-MinPWM)/(Tmax-Tmin)+MinPWM
+    let a="($1-$2+$6)*($5-$4)/($3-$2)+$4"
+    up_b=$a
+}
+function lowerBound
+{
+    # $1: temperature
+    # $2: Tmin
+    # $3: Tmax
+    # $4: MinPWM
+    # $5: MaxPWM
+    # $6 Thyst
+    # lower_bound = (temperature-Tmin) *(MaxPWM-MinPWM)/(Tmax-Tmin)+MinPWM
+    let a="($1-$2)*($5-$4)/($3-$2)+$4"
+    lw_b=$a
+}
+
 # main function
 function UpdateFanSpeeds
 {
 	local fcvcount
-	local pwmo tsens fan mint maxt minsa minso minpwm maxpwm
+	local pwmo tsens fan mint maxt minsa minso minpwm maxpwm tHyst
 	local tval pwmpval fanval min_fanval one_fan one_fanval
 	local -i pwmval
 
@@ -469,6 +514,16 @@ function UpdateFanSpeeds
 		minso=${AFCMINSTOP[$fcvcount]}
 		minpwm=${AFCMINPWM[$fcvcount]}
 		maxpwm=${AFCMAXPWM[$fcvcount]}
+		let tHyst="${AFCTHYST[$fcvcount]}*1000"
+
+		#if some fan fault detected all pwm=100%
+		CheckFanFault
+		if [ $? -ne 0 ]
+		then
+			echo $MAX > $pwmo
+			let fcvcount=$fcvcount+1
+			continue
+		fi
 
 		read tval < ${tsens}
 		if [ $? -ne 0 ]
@@ -532,22 +587,45 @@ function UpdateFanSpeeds
 			echo "pwmpval=$pwmpval"
 			echo "fanval=$fanval"
 			echo "min_fanval=$min_fanval"
+			echo "tHyst=$tHyst"
 		fi
-
-		if (( $tval <= $mint ))
-		  then pwmval=$minpwm # below min temp, use defined min pwm
+		pwmval=$pwmpval
+		if (( $tval+$tHyst <= $mint ))
+			then pwmval=$minpwm # below min temp, use defined min pwm
 		elif (( $tval >= $maxt ))
-		  then pwmval=$maxpwm # over max temp, use defined max pwm
+			then pwmval=$maxpwm # over max temp, use defined max pwm
+		elif (( $tval+$tHyst >= $maxt )) && (( $pwmpval == $maxpwm ))
+			then pwmval=$maxpwm
 		else
-		  # calculate the new value from temperature and settings
-		  pwmval="(${tval}-${mint})*(${maxpwm}-${minso})/(${maxt}-${mint})+${minso}"
-		  if [ $pwmpval -eq 0 -o $min_fanval -eq 0 ]
-		  then # if fan was stopped start it using a safe value
-		  	echo $minsa > $pwmo
-			# Sleep while still handling signals
-			sleep 1 &
-			wait
-		  fi
+			# calculate the new value from temperature and settings
+			# pwmval="(${tval}-${mint})*(${maxpwm}-${minso})/(${maxt}-${mint})+${minso}
+			lowerBound ${tval} ${mint} ${maxt} ${minpwm} ${maxpwm} ${tHyst}
+			lb=$lw_b
+			upperBound ${tval} ${mint} ${maxt} ${minpwm} ${maxpwm} ${tHyst}
+			ub=$up_b
+
+			if [ "$DEBUG" != "" ]
+			then
+				echo "old pwm=$pwmval lw_b=$lw_b up_b=$up_b"
+			fi
+
+			if [[ "$pwmval" -gt "$ub" ]]
+			then
+				pwmval=$ub
+			else
+				if [[ "$pwmval" -lt "$lb" ]]
+				then
+						pwmval=$lb
+				fi
+			fi
+
+			if [ $pwmpval -eq 0 -o $min_fanval -eq 0 ]
+			then # if fan was stopped start it using a safe value
+				echo $minsa > $pwmo
+				# Sleep while still handling signals
+				sleep 1 &
+				wait $!
+			fi
 		fi
 		echo $pwmval > $pwmo # write new value to pwm output
 		if [ $? -ne 0 ]
